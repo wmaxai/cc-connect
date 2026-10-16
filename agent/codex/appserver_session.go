@@ -64,6 +64,16 @@ type turnStartResponse struct {
 	} `json:"turn"`
 }
 
+type turnSteerResponse struct {
+	TurnID string `json:"turnId"`
+}
+
+// SteersMidTurn reports that this session absorbs input sent while a turn is
+// already running through Codex's native `turn/steer` request, rather than
+// queueing it or writing to stdin. The engine uses this to decide whether a
+// busy-session message can be applied to the running turn.
+func (s *appServerSession) SteersMidTurn() bool { return true }
+
 type turnNotification struct {
 	ThreadID string `json:"threadId"`
 	Turn     struct {
@@ -487,7 +497,8 @@ func (s *appServerSession) Send(prompt string, messageID string, images []core.I
 	}
 
 	s.stateMu.Lock()
-	if !s.preambleSent {
+	activeTurn := s.currentTurn
+	if activeTurn == "" && !s.preambleSent {
 		prompt = prependCodexPromptPreamble(prompt, s.promptPreamble)
 		s.preambleSent = true
 	}
@@ -511,6 +522,13 @@ func (s *appServerSession) Send(prompt string, messageID string, images []core.I
 		})
 	}
 
+	if activeTurn != "" {
+		return s.steerTurn(threadID, activeTurn, input)
+	}
+	return s.startTurn(threadID, input)
+}
+
+func (s *appServerSession) startTurn(threadID string, input []map[string]any) error {
 	params := map[string]any{
 		"threadId": threadID,
 		"input":    input,
@@ -538,6 +556,26 @@ func (s *appServerSession) Send(prompt string, messageID string, images []core.I
 	s.pendingMsgs = s.pendingMsgs[:0]
 	s.stateMu.Unlock()
 
+	return nil
+}
+
+func (s *appServerSession) steerTurn(threadID, expectedTurnID string, input []map[string]any) error {
+	params := map[string]any{
+		"threadId":       threadID,
+		"expectedTurnId": expectedTurnID,
+		"input":          input,
+	}
+
+	var resp turnSteerResponse
+	if err := s.request("turn/steer", params, &resp); err != nil {
+		return fmt.Errorf("codex app-server turn/steer: %w", err)
+	}
+	if resp.TurnID == "" {
+		return fmt.Errorf("codex app-server turn/steer returned empty turn id")
+	}
+	if resp.TurnID != expectedTurnID {
+		return fmt.Errorf("codex app-server turn/steer returned turn id %q, want %q", resp.TurnID, expectedTurnID)
+	}
 	return nil
 }
 

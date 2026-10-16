@@ -3238,6 +3238,12 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 		// ── end self-heal; queueing path below is unchanged ────────────────
 		// Session is busy — try to queue the message for the running turn
 		// so the agent processes it immediately after the current turn ends.
+		// Plain text is applied to the running turn first (custom 2026-10-16):
+		// Codex app-server turns absorb it as native `turn/steer`, so the agent
+		// picks it up mid-flight instead of waiting for the next turn.
+		if e.steerBusyPlainText(p, msg, interactiveKey, session) {
+			return
+		}
 		if e.queueMessageForBusySession(p, msg, interactiveKey) {
 			// Race guard: the drain loop in processInteractiveMessageWith may
 			// have just finished (session unlocked) between our TryLock failure
@@ -6872,6 +6878,69 @@ func (e *Engine) cmdPs(p Platform, msg *Message, args []string) {
 		return
 	}
 	e.reply(p, msg.ReplyCtx, e.i18n.T(MsgPsSent))
+}
+
+// midTurnSteerer is implemented by agent sessions that absorb a message sent
+// while a turn is already running into that same turn, instead of needing it
+// replayed after the turn ends. Codex app-server delivers it as native
+// `turn/steer` (see agent/codex/appserver_session.go). Sessions that do not
+// implement it keep the queueing path: injecting text into a running CLI turn
+// can leave the event loop waiting for a second result that never arrives.
+type midTurnSteerer interface {
+	SteersMidTurn() bool
+}
+
+// steerBusyPlainText applies a plain-text message that arrived while the
+// session lock was held to the turn that is already running, so the agent can
+// redirect mid-flight instead of only seeing it after the turn ends.
+//
+// It returns true when the message was handled. Anything it cannot steer —
+// empty text, media/attachments, a missing or dead agent session, a send
+// error, or a backend without mid-turn steering — returns false so the caller
+// falls back to the existing busy queue.
+func (e *Engine) steerBusyPlainText(p Platform, msg *Message, interactiveKey string, session *Session) bool {
+	if strings.TrimSpace(msg.Content) == "" ||
+		len(msg.Images) > 0 || len(msg.Files) > 0 || msg.Location != nil {
+		return false
+	}
+	e.interactiveMu.Lock()
+	state, ok := e.interactiveStates[interactiveKey]
+	e.interactiveMu.Unlock()
+	if !ok || state == nil || state.agentSession == nil || !state.agentSession.Alive() {
+		return false
+	}
+	// A message older than the running turn is a replay (platform resync, late
+	// delivery), not a course correction. Fall through so the queue path does
+	// the dropping — and the stale-message logging — in one place.
+	state.mu.Lock()
+	stale := e.isStaleUserMessageLocked(state, msg.UserMessageTimeMs)
+	state.mu.Unlock()
+	if stale {
+		return false
+	}
+	steerer, ok := state.agentSession.(midTurnSteerer)
+	if !ok || !steerer.SteersMidTurn() {
+		return false
+	}
+	if err := state.agentSession.Send(msg.Content, "", nil, nil); err != nil {
+		slog.Warn("busy steer: send failed, falling back to queue",
+			"session", msg.SessionKey, "user", msg.UserName, "error", err)
+		return false
+	}
+	// The steered text is part of the running turn, so it never passes through
+	// the normal "process message" path that records local history.
+	if session != nil {
+		session.AddHistory("user", msg.Content)
+	}
+	slog.Info("busy message steered into running turn",
+		"session", msg.SessionKey, "user", msg.UserName)
+	// Mirror the accepted-message bookkeeping the queueing path does: the
+	// platform adapter may want to ack the message. The turn watermark is
+	// deliberately left alone (noteUserMessageAccepted is not called) so
+	// already-queued messages keep their existing stale-message semantics.
+	runMessageAccepted(msg)
+	e.reply(p, msg.ReplyCtx, e.i18n.T(MsgSteered))
+	return true
 }
 
 // matchPrefix finds a unique command matching the given prefix.
