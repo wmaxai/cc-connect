@@ -75,8 +75,17 @@ func New(opts map[string]any) (core.Agent, error) {
 	if cmd == "" {
 		cmd = strings.TrimSpace(os.Getenv("CODEX_CLI_PATH"))
 	}
-	if _, err := resolveCodexExecutable(cmd); err != nil {
+	bin, err := resolveCodexExecutable(cmd)
+	if err != nil {
 		return nil, fmt.Errorf("codex: CLI lookup failed (set cmd or install with npm install -g @openai/codex): %w", err)
+	}
+	// Fork-only: when that lookup lands on @openai/codex's Node launcher, pin
+	// the native binary it wraps instead, so no spawn in this process ever owns
+	// a `node` child (see node_launcher.go). A no-op for every other path.
+	if native, ok := unwrapCodexNodeLauncher(bin); ok {
+		slog.Info("codex: resolved a Node launcher to the native binary",
+			"launcher", bin, "binary", native)
+		cmd = native
 	}
 
 	// Parse project-level env from opts["env"] (set via [projects.agent.options.env] in config.toml).
