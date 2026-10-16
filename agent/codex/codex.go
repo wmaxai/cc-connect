@@ -39,7 +39,7 @@ type Agent struct {
 	mode            string // "suggest" | "auto-edit" | "full-auto" | "yolo"
 	backend         string // "exec" | "app_server"
 	appServerURL    string
-	appServerScope  string // "shared" (default: one app-server for the whole cc-connect) | "process"
+	appServerScope  string // "process" (default: one app-server per session) | "shared" (one for the whole cc-connect)
 	codexHome       string
 	systemPrompt    string
 	appendPrompt    string
@@ -62,14 +62,13 @@ func New(opts map[string]any) (core.Agent, error) {
 	mode, _ := opts["mode"].(string)
 	backend, _ := opts["backend"].(string)
 	appServerURL, _ := opts["app_server_url"].(string)
-	appServerScope, _ := opts["app_server_scope"].(string)
+	appServerScope := appServerScopeFromOpts(opts)
 	codexHome, _ := opts["codex_home"].(string)
 	systemPrompt, _ := opts["system_prompt"].(string)
 	appendPrompt, _ := opts["append_system_prompt"].(string)
 	mode = normalizeMode(mode)
 	backend = normalizeBackend(backend)
 	appServerURL = normalizeAppServerURL(appServerURL)
-	appServerScope = normalizeAppServerScope(appServerScope)
 
 	cmd, cliExtraArgs := core.ParseCmdOpts(opts, "")
 
@@ -619,6 +618,9 @@ func (a *Agent) WorkspaceAgentOptions() map[string]any {
 	}
 	if a.appServerURL != "" {
 		opts["app_server_url"] = a.appServerURL
+	}
+	if a.appServerScope != "" {
+		opts["app_server_scope"] = a.appServerScope
 	}
 	if a.codexHome != "" {
 		opts["codex_home"] = a.codexHome

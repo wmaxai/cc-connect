@@ -9,10 +9,14 @@ package codex
 // stdio stream, each thread pinned to its own cwd/provider through
 // `thread/start` / `thread/resume` / `turn/start` params.
 //
-// Both shapes stay available, mirroring hermes' `multiplex_profiles`:
+// Both shapes stay available, mirroring hermes' `multiplex_profiles` (off by
+// default there, and off by default here):
 //
-//   - app_server_scope = "shared"  (default) one app-server for the process
-//   - app_server_scope = "process" a private app-server per agent session
+//   - app_server_scope = "process" (default) a private app-server per session
+//   - app_server_scope = "shared"  one app-server for the whole process
+//
+// `multiplex_profiles = true` is accepted as an alias for "shared", the way
+// hermes spells it.
 //
 // This file owns the shared side: the pool, the child process, the JSON-RPC
 // transport and the threadId routing. Sessions keep their per-conversation
@@ -45,15 +49,42 @@ const (
 	appServerScopeProcess = "process"
 )
 
+// normalizeAppServerScope resolves the two shapes. Anything unset or
+// unrecognized keeps the upstream behaviour of one app-server per session:
+// sharing is an explicit choice, exactly like hermes' multiplex_profiles
+// defaulting to false.
 func normalizeAppServerScope(raw string) string {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
-	case "", appServerScopeShared, "one", "multiplex":
-		return appServerScopeShared
 	case appServerScopeProcess, "private", "dedicated", "per_session", "per-session":
 		return appServerScopeProcess
-	default:
+	case appServerScopeShared, "one", "multiplex":
 		return appServerScopeShared
+	default:
+		return appServerScopeProcess
 	}
+}
+
+// appServerScopeFromOpts reads the scope knob, including hermes' spelling of
+// it: `multiplex_profiles = true` means "shared".
+func appServerScopeFromOpts(opts map[string]any) string {
+	if raw, ok := opts["app_server_scope"].(string); ok && strings.TrimSpace(raw) != "" {
+		return normalizeAppServerScope(raw)
+	}
+	switch multiplex := opts["multiplex_profiles"].(type) {
+	case bool:
+		if multiplex {
+			return appServerScopeShared
+		}
+		return appServerScopeProcess
+	case string:
+		switch strings.ToLower(strings.TrimSpace(multiplex)) {
+		case "1", "true", "yes", "on":
+			return appServerScopeShared
+		case "0", "false", "no", "off":
+			return appServerScopeProcess
+		}
+	}
+	return appServerScopeProcess
 }
 
 // appServerProviderDef is one `[model_providers.<name>]` the app-server must

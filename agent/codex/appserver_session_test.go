@@ -851,24 +851,54 @@ func TestAppServerSession_ThreadRequestParamsCarryPerThreadTarget(t *testing.T) 
 	}
 }
 
-// app_server_scope mirrors hermes' multiplex_profiles: shared by default, one
-// private process per session on request.
+// app_server_scope mirrors hermes' multiplex_profiles: one private process per
+// session by default, a single shared app-server on request.
 func TestNormalizeAppServerScope(t *testing.T) {
 	for in, want := range map[string]string{
-		"":            appServerScopeShared,
-		"shared":      appServerScopeShared,
-		"  SHARED  ":  appServerScopeShared,
-		"multiplex":   appServerScopeShared,
-		"one":         appServerScopeShared,
-		"nonsense":    appServerScopeShared,
+		// Sharing is opt-in: unset or unknown keeps one app-server per session,
+		// which is what upstream always did (and hermes' multiplex default too).
+		"":            appServerScopeProcess,
+		"nonsense":    appServerScopeProcess,
 		"process":     appServerScopeProcess,
 		"private":     appServerScopeProcess,
 		"per-session": appServerScopeProcess,
 		"PER_SESSION": appServerScopeProcess,
+		"shared":      appServerScopeShared,
+		"  SHARED  ":  appServerScopeShared,
+		"multiplex":   appServerScopeShared,
+		"one":         appServerScopeShared,
 	} {
 		if got := normalizeAppServerScope(in); got != want {
 			t.Errorf("normalizeAppServerScope(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+func TestAppServerScopeFromOpts(t *testing.T) {
+	tests := []struct {
+		name string
+		opts map[string]any
+		want string
+	}{
+		{name: "unset keeps one process per session", opts: map[string]any{}, want: appServerScopeProcess},
+		{name: "explicit shared", opts: map[string]any{"app_server_scope": "shared"}, want: appServerScopeShared},
+		{name: "explicit process", opts: map[string]any{"app_server_scope": "process"}, want: appServerScopeProcess},
+		// hermes' spelling of the same knob.
+		{name: "hermes alias on", opts: map[string]any{"multiplex_profiles": true}, want: appServerScopeShared},
+		{name: "hermes alias off", opts: map[string]any{"multiplex_profiles": false}, want: appServerScopeProcess},
+		{name: "hermes alias as string", opts: map[string]any{"multiplex_profiles": "true"}, want: appServerScopeShared},
+		{
+			name: "scope wins over the alias",
+			opts: map[string]any{"app_server_scope": "process", "multiplex_profiles": true},
+			want: appServerScopeProcess,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := appServerScopeFromOpts(tt.opts); got != tt.want {
+				t.Fatalf("appServerScopeFromOpts(%#v) = %q, want %q", tt.opts, got, tt.want)
+			}
+		})
 	}
 }
 
