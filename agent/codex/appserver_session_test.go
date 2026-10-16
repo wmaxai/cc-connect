@@ -320,6 +320,101 @@ func TestAppServerSession_SendRejectsMismatchedSteeringTurn(t *testing.T) {
 	}
 }
 
+// Regression: mid-turn narration (phase=commentary) used to land in pendingMsgs
+// and the next tool call demoted it to EventThinking, which compact/quiet
+// display modes drop. A long turn therefore looked frozen until it ended, and a
+// mid-turn course correction produced no visible answer.
+func TestAppServerSession_CommentaryAgentMessageEmitsTextImmediately(t *testing.T) {
+	s := &appServerSession{events: make(chan core.Event, 4), currentTurn: "turn-1"}
+
+	s.handleNotification("item/completed", mustMarshalItemNotification(t, map[string]any{
+		"type": "agentMessage", "text": "switching to the other repo instead", "phase": "commentary",
+	}))
+
+	event := waitForEvent(t, s.events)
+	if event.Type != core.EventText || event.Content != "switching to the other repo instead" {
+		t.Fatalf("event = %#v, want commentary published as EventText", event)
+	}
+	if _, pending := sendTestState(s); len(pending) != 0 {
+		t.Fatalf("pending messages = %v, want none (commentary is not buffered)", pending)
+	}
+	select {
+	case extra := <-s.events:
+		t.Fatalf("unexpected extra event %#v, want exactly one text event", extra)
+	default:
+	}
+}
+
+func TestAppServerSession_CommentarySurvivesToolBoundary(t *testing.T) {
+	s := &appServerSession{events: make(chan core.Event, 4), currentTurn: "turn-1"}
+
+	s.handleNotification("item/completed", mustMarshalItemNotification(t, map[string]any{
+		"type": "agentMessage", "text": "running the test suite now", "phase": "commentary",
+	}))
+	s.handleNotification("item/started", mustMarshalItemNotification(t, map[string]any{
+		"type": "commandExecution", "command": "go test ./...",
+	}))
+
+	event := waitForEvent(t, s.events)
+	if event.Type != core.EventText || event.Content != "running the test suite now" {
+		t.Fatalf("event = %#v, want the commentary as EventText", event)
+	}
+	if _, pending := sendTestState(s); len(pending) != 0 {
+		t.Fatalf("pending messages = %v, want none", pending)
+	}
+	// The tool call itself publishes a tool event; the narration must not come
+	// back as a thinking event, because compact/quiet display modes drop those.
+	for {
+		select {
+		case extra := <-s.events:
+			if extra.Type == core.EventThinking {
+				t.Fatalf("commentary was demoted to a thinking event: %#v", extra)
+			}
+		default:
+			return
+		}
+	}
+}
+
+func TestAppServerSession_TerminalAgentMessageStaysBuffered(t *testing.T) {
+	for _, tc := range []struct{ name, phase string }{
+		{name: "phase unknown", phase: ""},
+		{name: "final answer", phase: "final_answer"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &appServerSession{events: make(chan core.Event, 4), currentTurn: "turn-1"}
+			item := map[string]any{"type": "agentMessage", "text": "the terminal answer"}
+			if tc.phase != "" {
+				item["phase"] = tc.phase
+			}
+
+			s.handleNotification("item/completed", mustMarshalItemNotification(t, item))
+
+			if _, pending := sendTestState(s); len(pending) != 1 || pending[0] != "the terminal answer" {
+				t.Fatalf("pending messages = %v, want the terminal answer buffered", pending)
+			}
+			select {
+			case event := <-s.events:
+				t.Fatalf("unexpected event %#v, want the item buffered instead", event)
+			default:
+			}
+		})
+	}
+}
+
+func mustMarshalItemNotification(t *testing.T, item map[string]any) []byte {
+	t.Helper()
+	raw, err := json.Marshal(map[string]any{
+		"threadId": "thread-1",
+		"turnId":   "turn-1",
+		"item":     item,
+	})
+	if err != nil {
+		t.Fatalf("marshal item notification: %v", err)
+	}
+	return raw
+}
+
 func TestMapAppServerRateLimits_PrefersMultiBucketView(t *testing.T) {
 	report := mapAppServerRateLimits(appServerRateLimitsResponse{
 		RateLimits: appServerRateLimitSnapshot{
