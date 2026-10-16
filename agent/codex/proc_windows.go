@@ -23,6 +23,25 @@ func prepareCmdForKill(cmd *exec.Cmd) {
 	cmd.SysProcAttr.CreationFlags |= syscall.CREATE_NEW_PROCESS_GROUP
 }
 
+// gracefulStopCmd asks the process tree rooted at cmd to exit. Windows has no
+// SIGTERM, so this is taskkill without /F: the child gets a close request and
+// can still clean up its per-thread writer locks.
+func gracefulStopCmd(cmd *exec.Cmd) error {
+	if cmd == nil || cmd.Process == nil {
+		return nil
+	}
+	killCmd := exec.Command("taskkill", "/T", "/PID", strconv.Itoa(cmd.Process.Pid))
+	output, err := killCmd.CombinedOutput()
+	if err == nil {
+		return nil
+	}
+	lower := bytes.ToLower(output)
+	if bytes.Contains(lower, []byte("there is no running instance")) || bytes.Contains(lower, []byte("not found")) {
+		return nil
+	}
+	return fmt.Errorf("taskkill /T failed: %w: %s", err, processKillOutput(output))
+}
+
 func forceKillCmd(cmd *exec.Cmd) error {
 	if cmd == nil || cmd.Process == nil {
 		return nil

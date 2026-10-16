@@ -39,6 +39,7 @@ type Agent struct {
 	mode            string // "suggest" | "auto-edit" | "full-auto" | "yolo"
 	backend         string // "exec" | "app_server"
 	appServerURL    string
+	appServerScope  string // "process" (default: one app-server per session) | "shared" (one for the whole cc-connect)
 	codexHome       string
 	systemPrompt    string
 	appendPrompt    string
@@ -61,6 +62,7 @@ func New(opts map[string]any) (core.Agent, error) {
 	mode, _ := opts["mode"].(string)
 	backend, _ := opts["backend"].(string)
 	appServerURL, _ := opts["app_server_url"].(string)
+	appServerScope := appServerScopeFromOpts(opts)
 	codexHome, _ := opts["codex_home"].(string)
 	systemPrompt, _ := opts["system_prompt"].(string)
 	appendPrompt, _ := opts["append_system_prompt"].(string)
@@ -73,8 +75,17 @@ func New(opts map[string]any) (core.Agent, error) {
 	if cmd == "" {
 		cmd = strings.TrimSpace(os.Getenv("CODEX_CLI_PATH"))
 	}
-	if _, err := resolveCodexExecutable(cmd); err != nil {
+	bin, err := resolveCodexExecutable(cmd)
+	if err != nil {
 		return nil, fmt.Errorf("codex: CLI lookup failed (set cmd or install with npm install -g @openai/codex): %w", err)
+	}
+	// Fork-only: when that lookup lands on @openai/codex's Node launcher, pin
+	// the native binary it wraps instead, so no spawn in this process ever owns
+	// a `node` child (see node_launcher.go). A no-op for every other path.
+	if native, ok := unwrapCodexNodeLauncher(bin); ok {
+		slog.Info("codex: resolved a Node launcher to the native binary",
+			"launcher", bin, "binary", native)
+		cmd = native
 	}
 
 	// Parse project-level env from opts["env"] (set via [projects.agent.options.env] in config.toml).
@@ -101,6 +112,7 @@ func New(opts map[string]any) (core.Agent, error) {
 		mode:            mode,
 		backend:         backend,
 		appServerURL:    appServerURL,
+		appServerScope:  appServerScope,
 		codexHome:       strings.TrimSpace(codexHome),
 		systemPrompt:    strings.TrimSpace(systemPrompt),
 		appendPrompt:    strings.TrimSpace(appendPrompt),
@@ -493,6 +505,7 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 	reasoningEffort := a.reasoningEffort
 	backend := a.backend
 	appServerURL := a.appServerURL
+	appServerScope := a.appServerScope
 	codexHome := a.codexHome
 	systemPrompt := a.systemPrompt
 	appendPrompt := a.appendPrompt
@@ -526,7 +539,16 @@ func (a *Agent) StartSession(ctx context.Context, sessionID string) (core.AgentS
 	}
 
 	if backend == "app_server" {
-		return newAppServerSession(ctx, cliBin, cliExtraArgs, appServerURL, workDir, model, reasoningEffort, mode, sessionID, baseURL, provName, extraEnv, codexHome, systemPrompt, appendPrompt)
+		base := appServerConnBase{
+			cliBin:       cliBin,
+			cliExtraArgs: cliExtraArgs,
+			url:          appServerURL,
+			codexHome:    codexHome,
+			workDir:      workDir,
+			env:          appServerEnvForScope(extraEnv, appServerScope, provName),
+			scope:        appServerScope,
+		}
+		return newAppServerSession(ctx, base, workDir, model, reasoningEffort, mode, sessionID, baseURL, provName, systemPrompt, appendPrompt)
 	}
 	if codexHome != "" {
 		extraEnv = append(extraEnv, "CODEX_HOME="+codexHome)
@@ -561,7 +583,16 @@ func (a *Agent) DeleteSession(_ context.Context, sessionID string) error {
 	return os.Remove(path)
 }
 
-func (a *Agent) Stop() error { return nil }
+// Stop releases the shared app-server pool.
+//
+// The engine closes this project's sessions before calling Stop, so the pooled
+// child has no client left by then. In a single-project stop the child serving
+// the other projects is retired too: their sessions re-resume their threads on
+// a fresh process at the next turn (the same recovery path a crash takes).
+func (a *Agent) Stop() error {
+	shutdownSharedAppServers()
+	return nil
+}
 
 // SetMode changes the approval mode for future sessions.
 func (a *Agent) SetMode(mode string) {
@@ -596,6 +627,9 @@ func (a *Agent) WorkspaceAgentOptions() map[string]any {
 	}
 	if a.appServerURL != "" {
 		opts["app_server_url"] = a.appServerURL
+	}
+	if a.appServerScope != "" {
+		opts["app_server_scope"] = a.appServerScope
 	}
 	if a.codexHome != "" {
 		opts["codex_home"] = a.codexHome
@@ -745,6 +779,10 @@ func (a *Agent) SetProviders(providers []core.ProviderConfig) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.providers = providers
+	// Every provider has to be known by the app-server child before a thread can
+	// name it, and a child only learns its providers at spawn time — so register
+	// them process-wide here, whatever backend this project uses.
+	registerAppServerProviders(appServerProviderDefsFromCore(providers))
 }
 
 func (a *Agent) SetActiveProvider(name string) bool {
