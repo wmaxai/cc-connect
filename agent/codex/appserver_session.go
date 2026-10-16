@@ -1,15 +1,11 @@
 package codex
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -43,6 +39,7 @@ type initResponse struct {
 type threadStartResponse struct {
 	Cwd             string  `json:"cwd"`
 	Model           string  `json:"model"`
+	ModelProvider   string  `json:"modelProvider"`
 	ReasoningEffort *string `json:"reasoningEffort"`
 	Thread          struct {
 		ID string `json:"id"`
@@ -52,6 +49,7 @@ type threadStartResponse struct {
 type threadResumeResponse struct {
 	Cwd             string  `json:"cwd"`
 	Model           string  `json:"model"`
+	ModelProvider   string  `json:"modelProvider"`
 	ReasoningEffort *string `json:"reasoningEffort"`
 	Thread          struct {
 		ID string `json:"id"`
@@ -151,33 +149,35 @@ type appServerRequestUserInputAnswer struct {
 }
 
 type appServerSession struct {
-	cliBin         string
-	cliExtraArgs   []string
-	url            string
 	workDir        string
 	model          string
 	effort         string
 	mode           string
 	baseURL        string
 	modelProvider  string
-	extraEnv       []string
-	codexHome      string
 	promptPreamble string
 
 	events chan core.Event
+	// eventsMu guards the channel close: the shared app-server routes
+	// notifications from a conn goroutine, so a detach/close racing an in-flight
+	// notification must not panic on a closed channel.
+	eventsMu   sync.Mutex
+	eventsDone bool
 
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	cmd     *exec.Cmd
-	stdin   io.WriteCloser
-	procMu  sync.Mutex
-	writeMu sync.Mutex
+	// One `codex app-server` per cc-connect (see appserver_conn.go) serves every
+	// session; this session owns a single Codex thread on it. connBase describes
+	// how to (re)acquire that process: after a crash, or after a config change
+	// that needs a differently configured child.
+	connMu   sync.Mutex
+	conn     *appServerConn
+	connBase appServerConnBase
+	// pinned marks a transport injected by a test: never re-acquire.
+	pinned bool
 
-	nextID atomic.Int64
-
-	pendingMu sync.Mutex
-	pending   map[int64]chan rpcResponseEnvelope
+	attachedGen atomic.Int64
 
 	approvalsMu      sync.Mutex
 	pendingApprovals map[string]chan core.PermissionResult
@@ -186,7 +186,6 @@ type appServerSession struct {
 	alive    atomic.Bool
 
 	closeOnce sync.Once
-	wg        sync.WaitGroup
 
 	stateMu      sync.Mutex
 	pendingMsgs  []string
@@ -199,43 +198,68 @@ type appServerSession struct {
 }
 
 const (
-	appServerRequestTimeout      = 120 * time.Second
 	appServerUsageRefreshTimeout = 1500 * time.Millisecond
 )
 
-func newAppServerSession(ctx context.Context, cliBin string, cliExtraArgs []string, url, workDir, model, effort, mode, resumeID, baseURL, modelProvider string, extraEnv []string, codexHome string, systemPrompt string, appendPrompt string) (*appServerSession, error) {
+// appServerAttachAttempts bounds the retries for a thread that is still held by
+// the process we just replaced. A thread writer lock is codex' guard against two
+// processes writing one conversation; it is released when its owner exits
+// cleanly, so a busy lock right after a restart means the old app-server (or the
+// wrapper that spawned it) has not finished dying yet.
+const appServerAttachAttempts = 3
+
+// Kept as a variable only so tests do not have to wait out the backoff.
+var appServerAttachRetryDelay = 1200 * time.Millisecond
+
+func isThreadWriterBusy(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "already has an active writer")
+}
+
+// codex answers "no rollout found" when the thread id has no conversation file
+// in this CODEX_HOME: freshly created threads that never ran a turn, or a
+// session whose rollout lives in a different home. Such a thread carries no
+// history, so starting a new one loses nothing.
+func isThreadRolloutMissing(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "no rollout found")
+}
+
+// resumeThread resumes a thread, retrying the one failure that is worth waiting
+// out: a writer lock left by the process we just replaced.
+func (s *appServerSession) resumeThread(c *appServerConn, threadID string, params map[string]any) (threadResumeResponse, error) {
+	var resp threadResumeResponse
+	var err error
+	for attempt := 1; attempt <= appServerAttachAttempts; attempt++ {
+		err = c.request("thread/resume", params, &resp)
+		if err == nil || !isThreadWriterBusy(err) {
+			return resp, err
+		}
+		if attempt < appServerAttachAttempts {
+			slog.Warn("codex app-server: thread is still held by a previous writer, retrying",
+				"thread_id", threadID, "attempt", attempt, "error", err)
+			time.Sleep(appServerAttachRetryDelay)
+		}
+	}
+	return resp, fmt.Errorf("codex session is still held by a previous codex process, please retry in a moment: %w", err)
+}
+
+func newAppServerSession(ctx context.Context, base appServerConnBase, workDir, model, effort, mode, resumeID, baseURL, modelProvider string, systemPrompt string, appendPrompt string) (*appServerSession, error) {
 	sessionCtx, cancel := context.WithCancel(ctx)
 	s := &appServerSession{
-		cliBin:           cliBin,
-		cliExtraArgs:     append([]string(nil), cliExtraArgs...),
-		url:              url,
+		connBase:         base,
 		workDir:          workDir,
 		model:            model,
 		effort:           effort,
 		mode:             mode,
 		baseURL:          baseURL,
 		modelProvider:    modelProvider,
-		extraEnv:         append([]string(nil), extraEnv...),
-		codexHome:        strings.TrimSpace(codexHome),
 		promptPreamble:   buildCodexPromptPreamble(systemPrompt, appendPrompt),
 		events:           make(chan core.Event, 128),
 		ctx:              sessionCtx,
 		cancel:           cancel,
-		pending:          make(map[int64]chan rpcResponseEnvelope),
 		pendingApprovals: make(map[string]chan core.PermissionResult),
 		preambleSent:     resumeID != "" && resumeID != core.ContinueSession,
 	}
 	s.alive.Store(true)
-
-	if err := s.connect(); err != nil {
-		cancel()
-		return nil, err
-	}
-
-	if err := s.initialize(); err != nil {
-		_ = s.Close()
-		return nil, err
-	}
 
 	if err := s.ensureThread(resumeID); err != nil {
 		_ = s.Close()
@@ -246,6 +270,70 @@ func newAppServerSession(ctx context.Context, cliBin string, cliExtraArgs []stri
 	}
 
 	return s, nil
+}
+
+// transport returns the shared app-server this session talks to, acquiring (or
+// re-acquiring) it from the pool when the previous process died.
+func (s *appServerSession) transport() (*appServerConn, error) {
+	s.connMu.Lock()
+	current := s.conn
+	pinned := s.pinned
+	s.connMu.Unlock()
+
+	if current != nil && current.Alive() {
+		return current, nil
+	}
+	if pinned {
+		if current == nil {
+			return nil, fmt.Errorf("codex app-server session has no transport")
+		}
+		return current, nil
+	}
+
+	fresh, err := sharedAppServerPool.acquire(s.connBase)
+	if err != nil {
+		return nil, err
+	}
+	s.connMu.Lock()
+	if s.conn != fresh {
+		s.conn = fresh
+		s.attachedGen.Store(0)
+	}
+	s.connMu.Unlock()
+	if current != fresh {
+		fresh.attach(s)
+	}
+	return fresh, nil
+}
+
+func (s *appServerSession) currentConn() *appServerConn {
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+	return s.conn
+}
+
+// transportLost is called by the conn when the shared process died. The thread
+// itself survives on disk, so the next turn re-resumes it on a fresh process.
+func (s *appServerSession) transportLost(err error) {
+	s.attachedGen.Store(0)
+	if err != nil {
+		s.failRunningTurn(fmt.Errorf("codex app-server: %w", err))
+	}
+}
+
+// failRunningTurn surfaces a transport failure to whoever is waiting on the
+// current turn instead of letting the request time out silently.
+func (s *appServerSession) failRunningTurn(err error) {
+	if err == nil {
+		return
+	}
+	s.stateMu.Lock()
+	running := s.currentTurn != ""
+	s.stateMu.Unlock()
+	if !running {
+		return
+	}
+	s.failTurn(err)
 }
 
 // appServerListenURL returns the --listen value for the spawn. A stdio
@@ -262,135 +350,114 @@ func appServerListenURL(url string) string {
 	return listenURL
 }
 
-func (s *appServerSession) connect() error {
-	args := []string{"app-server"}
-	// With url "stdio://" the session speaks JSON-RPC over the stdio pipes.
-	// Pass no --listen flag in that case: on codex 0.152+ a --listen value
-	// (including ws://) switches the app-server to serve the protocol over
-	// the listener only, leaving stdio unresponsive and causing every
-	// initialize request to time out (see #1781). --listen stdio:// is kept
-	// for explicitness on older codex versions where it is a no-op, but a
-	// bare stdio transport should simply not open a listener.
-	if listenURL := appServerListenURL(s.url); listenURL != "" {
-		args = append(args, "--listen", listenURL)
-	}
-	if model := strings.TrimSpace(s.model); model != "" {
-		args = append(args, "-c", fmt.Sprintf("model=%q", model))
-	}
-	if effort := strings.TrimSpace(s.effort); effort != "" {
-		args = append(args, "-c", fmt.Sprintf("model_reasoning_effort=%q", effort))
-	}
-	if provider := strings.TrimSpace(s.modelProvider); provider != "" {
-		args = append(args, "-c", fmt.Sprintf("model_provider=%q", provider))
-	}
-	if baseURL := strings.TrimSpace(s.baseURL); baseURL != "" {
-		args = append(args, "-c", fmt.Sprintf("openai_base_url=%q", baseURL))
-	}
-	bin, err := resolveCodexExecutable(s.cliBin)
-	if err != nil {
-		return fmt.Errorf("codex app-server resolve CLI: %w", err)
-	}
-	args = append(append([]string(nil), s.cliExtraArgs...), args...)
-	cmd := exec.CommandContext(s.ctx, bin, args...)
-	cmd.Dir = s.workDir
-	env := append([]string(nil), s.extraEnv...)
-	if s.codexHome != "" {
-		env = append(env, "CODEX_HOME="+s.codexHome)
-	}
-	if len(env) > 0 {
-		cmd.Env = core.MergeEnv(os.Environ(), env)
-	}
-
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		return fmt.Errorf("codex app-server stdin pipe: %w", err)
-	}
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return fmt.Errorf("codex app-server stdout pipe: %w", err)
-	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return fmt.Errorf("codex app-server stderr pipe: %w", err)
-	}
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("codex app-server start: %w", err)
-	}
-
-	s.procMu.Lock()
-	s.cmd = cmd
-	s.stdin = stdin
-	s.procMu.Unlock()
-
-	slog.Info("codex app-server session started", "transport", "stdio", "pid", cmd.Process.Pid, "work_dir", s.workDir)
-
-	s.wg.Add(3)
-	go s.readLoop(stdout)
-	go s.stderrLoop(stderr)
-	go s.waitLoop()
-	return nil
-}
-
-func (s *appServerSession) initialize() error {
-	params := map[string]any{
-		"clientInfo": map[string]any{
-			"name":    "cc-connect-codex-agent",
-			"title":   "CC Connect Codex Agent",
-			"version": "0.1.0",
-		},
-		"capabilities": map[string]any{
-			"experimentalApi": true,
-			"optOutNotificationMethods": []string{
-				"command/exec/outputDelta",
-				"item/agentMessage/delta",
-				"item/plan/delta",
-				"item/fileChange/outputDelta",
-				"item/reasoning/summaryTextDelta",
-				"item/reasoning/textDelta",
-			},
-		},
-	}
-
-	var resp initResponse
-	if err := s.request("initialize", params, &resp); err != nil {
-		return fmt.Errorf("codex app-server initialize: %w", err)
-	}
-	if err := s.notify("initialized", nil); err != nil {
-		return fmt.Errorf("codex app-server initialized notify: %w", err)
-	}
-	return nil
-}
-
 func (s *appServerSession) ensureThread(resumeID string) error {
+	c, err := s.transport()
+	if err != nil {
+		return err
+	}
 	if resumeID != "" && resumeID != core.ContinueSession {
 		params := s.threadRequestParams()
 		params["threadId"] = resumeID
 		params["persistExtendedHistory"] = true
 
-		var resp threadResumeResponse
-		if err := s.request("thread/resume", params, &resp); err != nil {
+		resp, err := s.resumeThread(c, resumeID, params)
+		if err == nil {
+			if resp.Thread.ID == "" {
+				return fmt.Errorf("codex app-server resume returned empty thread id")
+			}
+			s.applyThreadRuntimeState(resp.Cwd, resp.Model, resp.ReasoningEffort)
+			s.threadID.Store(resp.Thread.ID)
+			s.bindTo(c)
+			slog.Info("codex app-server thread resumed", "thread_id", resp.Thread.ID,
+				"pid", c.pid(), "generation", c.Generation())
+			return nil
+		}
+		if !isThreadRolloutMissing(err) {
 			return err
 		}
-		if resp.Thread.ID == "" {
-			return fmt.Errorf("codex app-server resume returned empty thread id")
-		}
-		s.applyThreadRuntimeState(resp.Cwd, resp.Model, resp.ReasoningEffort)
-		s.threadID.Store(resp.Thread.ID)
-		slog.Info("codex app-server thread resumed", "thread_id", resp.Thread.ID)
-		return nil
+		// Nothing on disk to resume: the thread never wrote a rollout, or its
+		// rollout belongs to a different CODEX_HOME. A fresh thread carries the
+		// same (empty) history, so the session stays usable.
+		slog.Warn("codex app-server: no rollout for the requested session, starting a new thread",
+			"thread_id", resumeID, "error", err)
+		s.stateMu.Lock()
+		s.preambleSent = false
+		s.stateMu.Unlock()
 	}
 
 	var resp threadStartResponse
-	if err := s.request("thread/start", s.threadRequestParams(), &resp); err != nil {
+	if err := c.request("thread/start", s.threadRequestParams(), &resp); err != nil {
 		return err
 	}
 	if resp.Thread.ID == "" {
 		return fmt.Errorf("codex app-server start returned empty thread id")
 	}
 	s.applyThreadRuntimeState(resp.Cwd, resp.Model, resp.ReasoningEffort)
+	if provider := strings.TrimSpace(resp.ModelProvider); provider != "" {
+		s.modelProvider = provider
+	}
 	s.threadID.Store(resp.Thread.ID)
-	slog.Info("codex app-server thread started", "thread_id", resp.Thread.ID)
+	s.bindTo(c)
+	slog.Info("codex app-server thread started", "thread_id", resp.Thread.ID,
+		"pid", c.pid(), "generation", c.Generation(), "cwd", resp.Cwd,
+		"model_provider", s.modelProvider)
 	return nil
+}
+
+// bindTo records that this session's thread lives on c at its current
+// generation, so a later turn can tell whether the process was replaced.
+func (s *appServerSession) bindTo(c *appServerConn) {
+	threadID := s.CurrentSessionID()
+	c.bindThread(threadID, s)
+	s.attachedGen.Store(c.Generation())
+}
+
+// ensureThreadAttached makes sure the thread is served by a live process. After
+// a crash (or a config change that spawned a replacement) the thread is
+// re-resumed, which is the same path a fresh cc-connect takes for a stored
+// session id.
+func (s *appServerSession) ensureThreadAttached() (*appServerConn, error) {
+	c, err := s.transport()
+	if err != nil {
+		return nil, err
+	}
+	threadID := s.CurrentSessionID()
+	if threadID == "" {
+		return c, nil
+	}
+	if s.attachedGen.Load() == c.Generation() {
+		return c, nil
+	}
+
+	params := s.threadRequestParams()
+	params["threadId"] = threadID
+	params["persistExtendedHistory"] = true
+
+	if _, err := s.resumeThread(c, threadID, params); err != nil {
+		if !isThreadRolloutMissing(err) {
+			return nil, fmt.Errorf("codex app-server re-attach thread: %w", err)
+		}
+		// The thread the session was tracking has no rollout in this CODEX_HOME
+		// (it never ran a turn, or the home changed with it). Re-attaching is
+		// impossible, so continue on a fresh thread: an empty history is exactly
+		// what there was.
+		slog.Warn("codex app-server: thread has no rollout to re-attach, starting a new thread",
+			"thread_id", threadID, "error", err)
+		c.unbindThread(threadID)
+		s.attachedGen.Store(0)
+		s.threadID.Store("")
+		s.stateMu.Lock()
+		s.preambleSent = false
+		s.stateMu.Unlock()
+		if err := s.ensureThread(""); err != nil {
+			return nil, err
+		}
+		return s.transport()
+	}
+	s.bindTo(c)
+	slog.Info("codex app-server thread re-attached to shared process",
+		"thread_id", threadID, "pid", c.pid(), "generation", c.Generation())
+	return c, nil
 }
 
 func (s *appServerSession) threadRequestParams() map[string]any {
@@ -398,8 +465,16 @@ func (s *appServerSession) threadRequestParams() map[string]any {
 		"experimentalRawEvents":  false,
 		"persistExtendedHistory": false,
 	}
+	// cwd and provider are per-thread now that one process serves every
+	// project: this is what keeps two bots from sharing a working directory.
+	if cwd := strings.TrimSpace(s.GetWorkDir()); cwd != "" {
+		params["cwd"] = cwd
+	}
 	if model := s.GetModel(); model != "" {
 		params["model"] = model
+	}
+	if provider := strings.TrimSpace(s.modelProvider); provider != "" {
+		params["modelProvider"] = provider
 	}
 	if approval, sandbox := appServerModeSettings(s.mode); approval != "" {
 		params["approvalPolicy"] = approval
@@ -449,8 +524,12 @@ func (s *appServerSession) refreshUsage(ctx context.Context) error {
 		return context.DeadlineExceeded
 	}
 
+	c, err := s.transport()
+	if err != nil {
+		return err
+	}
 	var resp appServerRateLimitsResponse
-	if err := s.requestWithTimeout("account/rateLimits/read", map[string]any{}, &resp, timeout); err != nil {
+	if err := c.requestWithTimeout("account/rateLimits/read", map[string]any{}, &resp, timeout); err != nil {
 		return err
 	}
 	s.storeUsage(mapAppServerRateLimits(resp))
@@ -529,6 +608,10 @@ func (s *appServerSession) Send(prompt string, messageID string, images []core.I
 }
 
 func (s *appServerSession) startTurn(threadID string, input []map[string]any) error {
+	c, err := s.ensureThreadAttached()
+	if err != nil {
+		return err
+	}
 	params := map[string]any{
 		"threadId": threadID,
 		"input":    input,
@@ -544,7 +627,7 @@ func (s *appServerSession) startTurn(threadID string, input []map[string]any) er
 	}
 
 	var resp turnStartResponse
-	if err := s.request("turn/start", params, &resp); err != nil {
+	if err := c.request("turn/start", params, &resp); err != nil {
 		return fmt.Errorf("codex app-server turn/start: %w", err)
 	}
 	if resp.Turn.ID == "" {
@@ -560,6 +643,10 @@ func (s *appServerSession) startTurn(threadID string, input []map[string]any) er
 }
 
 func (s *appServerSession) steerTurn(threadID, expectedTurnID string, input []map[string]any) error {
+	c, err := s.ensureThreadAttached()
+	if err != nil {
+		return err
+	}
 	params := map[string]any{
 		"threadId":       threadID,
 		"expectedTurnId": expectedTurnID,
@@ -567,7 +654,7 @@ func (s *appServerSession) steerTurn(threadID, expectedTurnID string, input []ma
 	}
 
 	var resp turnSteerResponse
-	if err := s.request("turn/steer", params, &resp); err != nil {
+	if err := c.request("turn/steer", params, &resp); err != nil {
 		return fmt.Errorf("codex app-server turn/steer: %w", err)
 	}
 	if resp.TurnID == "" {
@@ -621,32 +708,28 @@ func (s *appServerSession) RespondPermission(requestID string, result core.Permi
 	return nil
 }
 
-func (s *appServerSession) handleServerRequest(probe map[string]json.RawMessage) {
-	rawID := probe["id"]
-	var method string
-	if err := json.Unmarshal(probe["method"], &method); err != nil {
-		return
-	}
-	params := probe["params"]
-
+// handleServerRequest answers a server-initiated request that belongs to this
+// session's thread. The conn has already resolved the threadId to this session,
+// so every reply goes back out over that shared transport.
+func (s *appServerSession) handleServerRequest(c *appServerConn, rawID json.RawMessage, method string, params json.RawMessage) {
 	switch method {
 	case "item/commandExecution/requestApproval", "item/fileChange/requestApproval":
-		s.handleApprovalRequest(rawID, method, params)
+		s.handleApprovalRequest(c, rawID, method, params)
 	case "item/permissions/requestApproval":
-		s.handlePermissionsApproval(rawID, params)
+		s.handlePermissionsApproval(c, rawID, params)
 	case "item/tool/requestUserInput":
-		s.handleRequestUserInput(rawID, params)
+		s.handleRequestUserInput(c, rawID, params)
 	case "item/tool/call":
-		s.handleDynamicToolCall(rawID, params)
+		s.handleDynamicToolCall(c, rawID, params)
 	default:
-		_ = s.writeJSON(map[string]any{
+		_ = c.writeJSON(map[string]any{
 			"jsonrpc": "2.0", "id": rawID,
 			"error": map[string]any{"code": -32601, "message": "method not found"},
 		})
 	}
 }
 
-func (s *appServerSession) handleApprovalRequest(rawID json.RawMessage, method string, paramsRaw json.RawMessage) {
+func (s *appServerSession) handleApprovalRequest(c *appServerConn, rawID json.RawMessage, method string, paramsRaw json.RawMessage) {
 	requestID := string(rawID)
 	var params map[string]any
 	if err := json.Unmarshal(paramsRaw, &params); err != nil {
@@ -703,14 +786,14 @@ func (s *appServerSession) handleApprovalRequest(rawID json.RawMessage, method s
 		if strings.EqualFold(result.Behavior, "allow") {
 			decision = "accept"
 		}
-		_ = s.writeJSON(map[string]any{
+		_ = c.writeJSON(map[string]any{
 			"jsonrpc": "2.0", "id": rawID,
 			"result": map[string]any{"decision": decision},
 		})
 	}()
 }
 
-func (s *appServerSession) handlePermissionsApproval(rawID json.RawMessage, paramsRaw json.RawMessage) {
+func (s *appServerSession) handlePermissionsApproval(c *appServerConn, rawID json.RawMessage, paramsRaw json.RawMessage) {
 	requestID := string(rawID)
 	var params map[string]any
 	if err := json.Unmarshal(paramsRaw, &params); err != nil {
@@ -751,12 +834,12 @@ func (s *appServerSession) handlePermissionsApproval(rawID json.RawMessage, para
 			if perms == nil {
 				perms = map[string]any{}
 			}
-			_ = s.writeJSON(map[string]any{
+			_ = c.writeJSON(map[string]any{
 				"jsonrpc": "2.0", "id": rawID,
 				"result": map[string]any{"permissions": perms, "scope": "turn"},
 			})
 		} else {
-			_ = s.writeJSON(map[string]any{
+			_ = c.writeJSON(map[string]any{
 				"jsonrpc": "2.0", "id": rawID,
 				"result": map[string]any{"permissions": map[string]any{}},
 			})
@@ -764,11 +847,11 @@ func (s *appServerSession) handlePermissionsApproval(rawID json.RawMessage, para
 	}()
 }
 
-func (s *appServerSession) handleRequestUserInput(rawID json.RawMessage, paramsRaw json.RawMessage) {
+func (s *appServerSession) handleRequestUserInput(c *appServerConn, rawID json.RawMessage, paramsRaw json.RawMessage) {
 	requestID := string(rawID)
 	var params appServerRequestUserInputParams
 	if err := json.Unmarshal(paramsRaw, &params); err != nil {
-		_ = s.writeJSON(map[string]any{
+		_ = c.writeJSON(map[string]any{
 			"jsonrpc": "2.0", "id": rawID,
 			"error": map[string]any{"code": -32602, "message": "invalid params"},
 		})
@@ -777,7 +860,7 @@ func (s *appServerSession) handleRequestUserInput(rawID json.RawMessage, paramsR
 
 	questions := appServerRequestUserInputQuestions(params.Questions)
 	if len(questions) == 0 {
-		_ = s.writeJSON(map[string]any{
+		_ = c.writeJSON(map[string]any{
 			"jsonrpc": "2.0", "id": rawID,
 			"result": appServerRequestUserInputResponse{Answers: map[string]appServerRequestUserInputAnswer{}},
 		})
@@ -816,15 +899,15 @@ func (s *appServerSession) handleRequestUserInput(rawID json.RawMessage, paramsR
 		s.approvalsMu.Unlock()
 
 		response := appServerRequestUserInputResponseFromResult(params.Questions, result)
-		_ = s.writeJSON(map[string]any{
+		_ = c.writeJSON(map[string]any{
 			"jsonrpc": "2.0", "id": rawID,
 			"result": response,
 		})
 	}()
 }
 
-func (s *appServerSession) handleDynamicToolCall(rawID json.RawMessage, paramsRaw json.RawMessage) {
-	_ = s.writeJSON(map[string]any{
+func (s *appServerSession) handleDynamicToolCall(c *appServerConn, rawID json.RawMessage, paramsRaw json.RawMessage) {
+	_ = c.writeJSON(map[string]any{
 		"jsonrpc": "2.0", "id": rawID,
 		"result": map[string]any{
 			"success":      false,
@@ -945,7 +1028,7 @@ func appServerRequestUserInputAnswerValues(raw any) []string {
 	}
 }
 
-func (s *appServerSession) rejectPendingApprovals(err error) {
+func (s *appServerSession) rejectPendingApprovals(_ error) {
 	s.approvalsMu.Lock()
 	defer s.approvalsMu.Unlock()
 	for id, ch := range s.pendingApprovals {
@@ -1009,162 +1092,27 @@ func (s *appServerSession) Close() error {
 	s.alive.Store(false)
 	s.cancel()
 
-	s.procMu.Lock()
-	if s.stdin != nil {
-		_ = s.stdin.Close()
-		s.stdin = nil
+	// A session owns only its thread: detaching from the shared app-server keeps
+	// the process (and every other project's thread) alive. The pinned
+	// per-session scope keeps the pre-fork ownership model, where closing the
+	// session reaps the child it spawned.
+	c := s.currentConn()
+	if c != nil {
+		c.detach(s)
+		c.unbindThread(s.CurrentSessionID())
+		if !c.pooled {
+			_ = c.Close()
+		}
 	}
-	if s.cmd != nil && s.cmd.Process != nil {
-		_ = s.cmd.Process.Kill()
-	}
-	s.procMu.Unlock()
+	s.rejectPendingApprovals(context.Canceled)
 
-	done := make(chan struct{})
-	go func() {
-		s.wg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-	}
-
-	s.closeOnce.Do(func() {
+	s.eventsMu.Lock()
+	if !s.eventsDone {
+		s.eventsDone = true
 		close(s.events)
-	})
+	}
+	s.eventsMu.Unlock()
 	return nil
-}
-
-func (s *appServerSession) readLoop(r io.Reader) {
-	defer s.wg.Done()
-	scanner := bufio.NewScanner(r)
-	scanBuf := make([]byte, 0, 64*1024)
-	const maxLineSize = 10 * 1024 * 1024 // 10MB
-	scanner.Buffer(scanBuf, maxLineSize)
-
-	for scanner.Scan() {
-		select {
-		case <-s.ctx.Done():
-			return
-		default:
-		}
-
-		data := scanner.Bytes()
-
-		var probe map[string]json.RawMessage
-		if err := json.Unmarshal(data, &probe); err != nil {
-			slog.Debug("codex app-server: invalid JSON", "error", err)
-			continue
-		}
-
-		_, hasID := probe["id"]
-		_, hasMethod := probe["method"]
-
-		switch {
-		case hasID && !hasMethod:
-			// Response to one of our requests.
-			var resp rpcResponseEnvelope
-			if err := json.Unmarshal(data, &resp); err != nil {
-				slog.Debug("codex app-server: bad response envelope", "error", err)
-				continue
-			}
-			s.handleResponse(resp)
-
-		case hasID && hasMethod:
-			// Server-initiated request that requires a response (e.g. approval).
-			s.handleServerRequest(probe)
-
-		default:
-			// Notification (no id).
-			var notif rpcNotificationEnvelope
-			if err := json.Unmarshal(data, &notif); err != nil {
-				slog.Debug("codex app-server: bad notification envelope", "error", err)
-				continue
-			}
-			s.handleNotification(notif.Method, notif.Params)
-		}
-	}
-
-	err := scanner.Err()
-	if err != nil {
-		if s.ctx.Err() == nil && !errors.Is(err, io.EOF) {
-			slog.Warn("codex app-server read failed", "error", err)
-			if errors.Is(err, bufio.ErrTooLong) {
-				s.emitError(fmt.Errorf("codex app-server line exceeds max size (%d bytes): %w", maxLineSize, err))
-			} else {
-				s.emitError(fmt.Errorf("codex app-server connection closed: %w", err))
-			}
-		}
-		s.alive.Store(false)
-		s.rejectPending(err)
-		s.rejectPendingApprovals(err)
-		return
-	}
-
-	s.alive.Store(false)
-	s.rejectPending(io.EOF)
-	s.rejectPendingApprovals(io.EOF)
-}
-
-func (s *appServerSession) stderrLoop(r io.Reader) {
-	defer s.wg.Done()
-	scanner := bufio.NewScanner(r)
-	buf := make([]byte, 0, 64*1024)
-	scanner.Buffer(buf, 1024*1024)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-		slog.Debug("codex app-server stderr", "line", line)
-	}
-	if err := scanner.Err(); err != nil && s.ctx.Err() == nil {
-		slog.Debug("codex app-server stderr read failed", "error", err)
-	}
-}
-
-func (s *appServerSession) waitLoop() {
-	defer s.wg.Done()
-
-	s.procMu.Lock()
-	cmd := s.cmd
-	s.procMu.Unlock()
-	if cmd == nil {
-		return
-	}
-
-	err := cmd.Wait()
-	if s.ctx.Err() == nil && err != nil {
-		slog.Warn("codex app-server exited unexpectedly", "error", err)
-		s.emitError(fmt.Errorf("codex app-server exited: %w", err))
-	}
-	s.alive.Store(false)
-	if err == nil {
-		err = io.EOF
-	}
-	s.rejectPending(err)
-}
-
-func (s *appServerSession) handleResponse(resp rpcResponseEnvelope) {
-	id, ok := rpcIDToInt64(resp.ID)
-	if !ok {
-		return
-	}
-
-	s.pendingMu.Lock()
-	ch := s.pending[id]
-	delete(s.pending, id)
-	s.pendingMu.Unlock()
-
-	if ch == nil {
-		return
-	}
-
-	select {
-	case ch <- resp:
-	default:
-	}
 }
 
 func (s *appServerSession) handleNotification(method string, paramsRaw json.RawMessage) {
@@ -1669,6 +1617,11 @@ func (s *appServerSession) flushPendingAsText() {
 }
 
 func (s *appServerSession) emit(event core.Event) {
+	s.eventsMu.Lock()
+	defer s.eventsMu.Unlock()
+	if s.eventsDone {
+		return
+	}
 	select {
 	case s.events <- event:
 	default:
@@ -1681,166 +1634,4 @@ func (s *appServerSession) emitError(err error) {
 		return
 	}
 	s.emit(core.Event{Type: core.EventError, Error: err})
-}
-
-func (s *appServerSession) rejectPending(err error) {
-	s.pendingMu.Lock()
-	defer s.pendingMu.Unlock()
-	for id, ch := range s.pending {
-		delete(s.pending, id)
-		select {
-		case ch <- rpcResponseEnvelope{ID: id, Error: &rpcError{Message: err.Error()}}:
-		default:
-		}
-	}
-}
-
-func (s *appServerSession) request(method string, params any, out any) error {
-	return s.requestWithTimeout(method, params, out, appServerRequestTimeout)
-}
-
-func (s *appServerSession) requestWithTimeout(method string, params any, out any, timeout time.Duration) error {
-	id := s.nextID.Add(1)
-	ch := make(chan rpcResponseEnvelope, 1)
-
-	s.pendingMu.Lock()
-	if s.pending == nil {
-		s.pending = make(map[int64]chan rpcResponseEnvelope)
-	}
-	s.pending[id] = ch
-	s.pendingMu.Unlock()
-
-	payload := map[string]any{
-		"jsonrpc": "2.0",
-		"id":      id,
-		"method":  method,
-		"params":  params,
-	}
-
-	deadline := time.Now().Add(timeout)
-	if err := s.writeJSONWithTimeout(method, payload, timeout); err != nil {
-		s.pendingMu.Lock()
-		delete(s.pending, id)
-		s.pendingMu.Unlock()
-		return err
-	}
-	remaining := time.Until(deadline)
-	if remaining <= 0 {
-		s.pendingMu.Lock()
-		delete(s.pending, id)
-		s.pendingMu.Unlock()
-		return fmt.Errorf("%s timed out", method)
-	}
-
-	timer := time.NewTimer(remaining)
-	defer timer.Stop()
-	ctxDone := s.contextDone()
-	select {
-	case resp := <-ch:
-		if resp.Error != nil {
-			return fmt.Errorf("%s", strings.TrimSpace(resp.Error.Message))
-		}
-		if out != nil {
-			if err := json.Unmarshal(resp.Result, out); err != nil {
-				return fmt.Errorf("decode %s response: %w", method, err)
-			}
-		}
-		return nil
-	case <-ctxDone:
-		return s.contextErr()
-	case <-timer.C:
-		s.pendingMu.Lock()
-		delete(s.pending, id)
-		s.pendingMu.Unlock()
-		return fmt.Errorf("%s timed out", method)
-	}
-}
-
-func (s *appServerSession) writeJSONWithTimeout(method string, v any, timeout time.Duration) error {
-	done := make(chan error, 1)
-	go func() {
-		done <- s.writeJSON(v)
-	}()
-
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-
-	ctxDone := s.contextDone()
-	select {
-	case err := <-done:
-		return err
-	case <-ctxDone:
-		return s.contextErr()
-	case <-timer.C:
-		err := fmt.Errorf("%s write timed out", method)
-		slog.Warn("codex app-server write timed out, closing session", "method", method, "timeout", timeout)
-		s.abortTransport()
-		return err
-	}
-}
-
-func (s *appServerSession) contextDone() <-chan struct{} {
-	if s.ctx == nil {
-		return nil
-	}
-	return s.ctx.Done()
-}
-
-func (s *appServerSession) contextErr() error {
-	if s.ctx == nil {
-		return context.Canceled
-	}
-	if err := s.ctx.Err(); err != nil {
-		return err
-	}
-	return context.Canceled
-}
-
-func (s *appServerSession) abortTransport() {
-	s.alive.Store(false)
-	if s.cancel != nil {
-		s.cancel()
-	}
-
-	s.procMu.Lock()
-	if s.stdin != nil {
-		_ = s.stdin.Close()
-		s.stdin = nil
-	}
-	if s.cmd != nil && s.cmd.Process != nil {
-		_ = s.cmd.Process.Kill()
-	}
-	s.procMu.Unlock()
-}
-
-func (s *appServerSession) notify(method string, params any) error {
-	payload := map[string]any{
-		"jsonrpc": "2.0",
-		"method":  method,
-	}
-	if params != nil {
-		payload["params"] = params
-	}
-	return s.writeJSON(payload)
-}
-
-func (s *appServerSession) writeJSON(v any) error {
-	b, err := json.Marshal(v)
-	if err != nil {
-		return fmt.Errorf("codex app-server encode: %w", err)
-	}
-
-	s.procMu.Lock()
-	stdin := s.stdin
-	s.procMu.Unlock()
-	if stdin == nil {
-		return fmt.Errorf("codex app-server connection is closed")
-	}
-
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	if _, err := stdin.Write(append(b, '\n')); err != nil {
-		return fmt.Errorf("codex app-server write: %w", err)
-	}
-	return nil
 }

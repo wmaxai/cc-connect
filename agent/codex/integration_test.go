@@ -1,12 +1,14 @@
 package codex
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestIntegration_CodexProviderFlow verifies the full provider config flow:
@@ -106,5 +108,107 @@ func TestIntegration_CodexProviderFlow(t *testing.T) {
 	}
 	if !strings.Contains(string(output), "integration-ok") {
 		t.Errorf("expected 'integration-ok' in output, got:\n%s", output)
+	}
+}
+
+// TestIntegration_SharedAppServerServesTwoProjects pins down the multiplex
+// shape: two sessions from two projects share one `codex app-server` child, and
+// each thread keeps its own working directory.
+//
+// Requires the codex CLI in PATH and a working ~/.codex login. It starts real
+// processes but runs no turn, so it costs no model tokens.
+// Run with: CC_CODEX_SHARED_APPSERVER_TEST=1 go test ./agent/codex/ -run TestIntegration_SharedAppServer -v
+func TestIntegration_SharedAppServerServesTwoProjects(t *testing.T) {
+	if os.Getenv("CC_CODEX_SHARED_APPSERVER_TEST") == "" {
+		t.Skip("CC_CODEX_SHARED_APPSERVER_TEST not set, skipping integration test")
+	}
+	bin, err := resolveCodexExecutable("")
+	if err != nil {
+		t.Skip("codex CLI not in PATH, skipping integration test")
+	}
+
+	// Clear the pool so this test observes only the children it spawns.
+	shutdownSharedAppServers()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	// A scratch CODEX_HOME keeps the test out of the user's ~/.codex: the child
+	// writes sqlite state there, and thread/start needs no auth.
+	codexHome := t.TempDir()
+	dirA := t.TempDir()
+	dirB := t.TempDir()
+	shared := appServerConnBase{cliBin: bin, url: "stdio://", codexHome: codexHome, scope: appServerScopeShared}
+
+	baseA := shared
+	baseA.workDir = dirA
+	baseB := shared
+	baseB.workDir = dirB
+
+	sessionA, err := newAppServerSession(ctx, baseA, dirA, "", "", "yolo", "", "", "", "", "")
+	if err != nil {
+		t.Fatalf("start session A: %v", err)
+	}
+	defer func() { _ = sessionA.Close() }()
+	sessionB, err := newAppServerSession(ctx, baseB, dirB, "", "", "yolo", "", "", "", "", "")
+	if err != nil {
+		t.Fatalf("start session B: %v", err)
+	}
+	defer func() { _ = sessionB.Close() }()
+
+	if sessionA.CurrentSessionID() == "" || sessionB.CurrentSessionID() == "" {
+		t.Fatalf("thread ids = %q / %q, want both set", sessionA.CurrentSessionID(), sessionB.CurrentSessionID())
+	}
+	if sessionA.CurrentSessionID() == sessionB.CurrentSessionID() {
+		t.Fatalf("both sessions resumed the same thread %q", sessionA.CurrentSessionID())
+	}
+	connA, connB := sessionA.currentConn(), sessionB.currentConn()
+	if connA != connB {
+		t.Fatalf("sessions landed on two different app-server processes (%p vs %p)", connA, connB)
+	}
+	t.Logf("shared app-server pid=%d generation=%d threads=%s / %s",
+		connA.pid(), connA.Generation(), sessionA.CurrentSessionID(), sessionB.CurrentSessionID())
+
+	if got := sessionA.GetWorkDir(); got != dirA {
+		t.Errorf("session A work dir = %q, want %q", got, dirA)
+	}
+	if got := sessionB.GetWorkDir(); got != dirB {
+		t.Errorf("session B work dir = %q, want %q", got, dirB)
+	}
+
+	// A private child per session has to stay available for callers that ask
+	// for it, and it must not be the pooled one.
+	privateBase := shared
+	privateBase.scope = appServerScopeProcess
+	privateBase.workDir = dirA
+	privateSession, err := newAppServerSession(ctx, privateBase, dirA, "", "", "yolo", "", "", "", "", "")
+	if err != nil {
+		t.Fatalf("start private session: %v", err)
+	}
+	defer func() { _ = privateSession.Close() }()
+	if privateSession.currentConn() == connA {
+		t.Fatal("scope=process reused the shared app-server instead of spawning its own")
+	}
+	if got := privateSession.GetWorkDir(); got != dirA {
+		t.Errorf("private session work dir = %q, want %q", got, dirA)
+	}
+	if err := privateSession.Close(); err != nil {
+		t.Fatalf("close private session: %v", err)
+	}
+	if privateSession.currentConn().Alive() {
+		t.Error("private process outlived its session")
+	}
+
+	// The shared process survives one of its sessions closing.
+	if err := sessionB.Close(); err != nil {
+		t.Fatalf("close session B: %v", err)
+	}
+	if !connA.Alive() {
+		t.Error("closing one session killed the shared app-server")
+	}
+
+	shutdownSharedAppServers()
+	if connA.Alive() {
+		t.Error("shared app-server survived shutdown")
 	}
 }

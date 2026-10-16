@@ -182,25 +182,18 @@ func TestAppServerSession_FailedTurnEmitsError(t *testing.T) {
 	}
 }
 
-func TestAppServerSession_RequestTimeoutIncludesBlockedStdinWrite(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
+// The write path now lives on the shared conn, so a wedged stdin gets the whole
+// process recycled instead of hanging one session's request forever.
+func TestAppServerConn_RequestTimeoutIncludesBlockedStdinWrite(t *testing.T) {
 	stdin := newBlockingWriteCloser()
 	defer func() { _ = stdin.Close() }()
 
-	s := &appServerSession{
-		ctx:     ctx,
-		cancel:  cancel,
-		events:  make(chan core.Event),
-		stdin:   stdin,
-		pending: make(map[int64]chan rpcResponseEnvelope),
-	}
+	c := newTestConn(stdin)
 
 	done := make(chan error, 1)
 	go func() {
 		var out map[string]any
-		done <- s.requestWithTimeout("turn/start", map[string]any{
+		done <- c.requestWithTimeout("turn/start", map[string]any{
 			"input": strings.Repeat("x", 1024),
 		}, &out, 25*time.Millisecond)
 	}()
@@ -452,18 +445,18 @@ func TestMapAppServerRateLimits_PrefersMultiBucketView(t *testing.T) {
 }
 
 func TestAppServerSession_HandleRequestUserInputEmitsAskQuestion(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
 	stdin := &lockedWriteCloser{}
+	c := newTestConn(stdin)
+	t.Cleanup(func() { _ = c.Close() })
 	s := &appServerSession{
 		events:           make(chan core.Event, 4),
-		ctx:              ctx,
+		ctx:              context.Background(),
 		pendingApprovals: make(map[string]chan core.PermissionResult),
-		stdin:            stdin,
+		conn:             c,
+		pinned:           true,
 	}
 
-	s.handleServerRequest(serverRequestProbe(t, `"rui-1"`, "item/tool/requestUserInput", map[string]any{
+	s.handleServerRequest(c, json.RawMessage(`"rui-1"`), "item/tool/requestUserInput", serverRequestParams(t, map[string]any{
 		"threadId": "thread-1",
 		"turnId":   "turn-1",
 		"itemId":   "call-1",
@@ -513,18 +506,18 @@ func TestAppServerSession_HandleRequestUserInputEmitsAskQuestion(t *testing.T) {
 }
 
 func TestAppServerSession_HandleRequestUserInputWritesCodexResponse(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
 	stdin := &lockedWriteCloser{}
+	c := newTestConn(stdin)
+	t.Cleanup(func() { _ = c.Close() })
 	s := &appServerSession{
 		events:           make(chan core.Event, 4),
-		ctx:              ctx,
+		ctx:              context.Background(),
 		pendingApprovals: make(map[string]chan core.PermissionResult),
-		stdin:            stdin,
+		conn:             c,
+		pinned:           true,
 	}
 
-	s.handleServerRequest(serverRequestProbe(t, `"rui-2"`, "item/tool/requestUserInput", map[string]any{
+	s.handleServerRequest(c, json.RawMessage(`"rui-2"`), "item/tool/requestUserInput", serverRequestParams(t, map[string]any{
 		"threadId": "thread-1",
 		"turnId":   "turn-1",
 		"itemId":   "call-2",
@@ -653,21 +646,33 @@ func (w *blockingWriteCloser) Closed() bool {
 
 var _ io.WriteCloser = (*blockingWriteCloser)(nil)
 
-func serverRequestProbe(t *testing.T, idJSON, method string, params any) map[string]json.RawMessage {
+func serverRequestParams(t *testing.T, params any) json.RawMessage {
 	t.Helper()
 	paramsJSON, err := json.Marshal(params)
 	if err != nil {
 		t.Fatalf("marshal params: %v", err)
 	}
-	methodJSON, err := json.Marshal(method)
-	if err != nil {
-		t.Fatalf("marshal method: %v", err)
+	return paramsJSON
+}
+
+// newTestConn builds a conn whose transport writes into w instead of a real
+// `codex app-server` child, so tests can drive thread routing and the request
+// path without spawning a process. It is pooled like a shared child; the
+// process-scope tests flip that flag.
+func newTestConn(w io.WriteCloser) *appServerConn {
+	ctx, cancel := context.WithCancel(context.Background())
+	c := &appServerConn{
+		gen:      1,
+		ctx:      ctx,
+		cancel:   cancel,
+		stdin:    w,
+		pending:  map[int64]chan rpcResponseEnvelope{},
+		sessions: map[*appServerSession]struct{}{},
+		routes:   map[string]*appServerSession{},
+		pooled:   true,
 	}
-	return map[string]json.RawMessage{
-		"id":     json.RawMessage(idJSON),
-		"method": methodJSON,
-		"params": paramsJSON,
-	}
+	c.alive.Store(true)
+	return c
 }
 
 type clientRequestProbe struct {
@@ -678,22 +683,38 @@ type clientRequestProbe struct {
 
 func newSendTestSession(t *testing.T, currentTurn string, pendingMsgs ...string) (*appServerSession, *lockedWriteCloser) {
 	t.Helper()
+	stdin := &lockedWriteCloser{}
+	conn := newTestConn(stdin)
+	t.Cleanup(func() { _ = conn.Close() })
+	s := newPinnedSession(t, conn, "thread-1", currentTurn)
+	// The Send tests keep the pre-fork ownership model: one session, one child.
+	s.connBase = appServerConnBase{scope: appServerScopeProcess}
+	s.pendingMsgs = append([]string(nil), pendingMsgs...)
+	return s, stdin
+}
+
+// newPinnedSession builds a session bound to an already-created conn, which is
+// how a shared app-server serves several projects at once.
+func newPinnedSession(t *testing.T, conn *appServerConn, threadID, currentTurn string) *appServerSession {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	stdin := &lockedWriteCloser{}
 	s := &appServerSession{
 		ctx:          ctx,
 		cancel:       cancel,
 		events:       make(chan core.Event, 8),
-		stdin:        stdin,
-		pending:      make(map[int64]chan rpcResponseEnvelope),
+		conn:         conn,
+		pinned:       true,
+		connBase:     appServerConnBase{scope: appServerScopeShared},
 		preambleSent: true,
 		currentTurn:  currentTurn,
-		pendingMsgs:  append([]string(nil), pendingMsgs...),
 	}
 	s.alive.Store(true)
-	s.threadID.Store("thread-1")
-	return s, stdin
+	s.threadID.Store(threadID)
+	conn.attach(s)
+	conn.bindThread(threadID, s)
+	s.attachedGen.Store(conn.Generation())
+	return s
 }
 
 func sendAndRespond(t *testing.T, s *appServerSession, stdin *lockedWriteCloser, prompt string, result any) (clientRequestProbe, error) {
@@ -707,7 +728,7 @@ func sendAndRespond(t *testing.T, s *appServerSession, stdin *lockedWriteCloser,
 	if err != nil {
 		t.Fatalf("marshal response: %v", err)
 	}
-	s.handleResponse(rpcResponseEnvelope{ID: request.ID, Result: resultJSON})
+	s.currentConn().handleResponse(rpcResponseEnvelope{ID: request.ID, Result: resultJSON})
 	select {
 	case err := <-done:
 		return request, err
@@ -736,7 +757,14 @@ func waitForEvent(t *testing.T, events <-chan core.Event) core.Event {
 
 func waitForClientRequest(t *testing.T, w *lockedWriteCloser) clientRequestProbe {
 	t.Helper()
-	line := waitForWrittenJSONLine(t, w)
+	return waitForClientRequestAt(t, w, 0)
+}
+
+// waitForClientRequestAt decodes the nth JSON-RPC message written to w, so a
+// test can drive a request sequence (retry, fallback) without a real child.
+func waitForClientRequestAt(t *testing.T, w *lockedWriteCloser, index int) clientRequestProbe {
+	t.Helper()
+	line := waitForWrittenJSONLineAt(t, w, index)
 	var request clientRequestProbe
 	if err := json.Unmarshal([]byte(line), &request); err != nil {
 		t.Fatalf("decode JSON-RPC request %q: %v", line, err)
@@ -746,19 +774,28 @@ func waitForClientRequest(t *testing.T, w *lockedWriteCloser) clientRequestProbe
 
 func waitForWrittenJSONLine(t *testing.T, w *lockedWriteCloser) string {
 	t.Helper()
+	return waitForWrittenJSONLineAt(t, w, 0)
+}
+
+func waitForWrittenJSONLineAt(t *testing.T, w *lockedWriteCloser, index int) string {
+	t.Helper()
 	deadline := time.After(time.Second)
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-deadline:
-			t.Fatalf("timed out waiting for JSON response, buffer=%q", w.String())
+			t.Fatalf("timed out waiting for JSON response #%d, buffer=%q", index, w.String())
 		case <-ticker.C:
+			lines := make([]string, 0, index+1)
 			for _, line := range strings.Split(w.String(), "\n") {
 				line = strings.TrimSpace(line)
 				if line != "" {
-					return line
+					lines = append(lines, line)
 				}
+			}
+			if len(lines) > index {
+				return lines[index]
 			}
 		}
 	}
@@ -766,21 +803,331 @@ func waitForWrittenJSONLine(t *testing.T, w *lockedWriteCloser) string {
 
 func TestAppServerListenURL(t *testing.T) {
 	cases := map[string]string{
-		"":                       "",
-		"  ":                     "",
-		"stdio://":               "",
-		"stdio":                  "",
-		"ws://127.0.0.1:3845":    "ws://127.0.0.1:3845",
-		"ws://localhost:9000":    "ws://localhost:9000",
-		"ws://127.0.0.1:3845 ":   "ws://127.0.0.1:3845",
-		" stdio ":                 "",
-		" stdio:// ":               "",
-		"STDIO":                    "",
-		"STDIO://":                 "",
+		"":                     "",
+		"  ":                   "",
+		"stdio://":             "",
+		"stdio":                "",
+		"ws://127.0.0.1:3845":  "ws://127.0.0.1:3845",
+		"ws://localhost:9000":  "ws://localhost:9000",
+		"ws://127.0.0.1:3845 ": "ws://127.0.0.1:3845",
+		" stdio ":              "",
+		" stdio:// ":           "",
+		"STDIO":                "",
+		"STDIO://":             "",
 	}
 	for in, want := range cases {
 		if got := appServerListenURL(in); got != want {
 			t.Errorf("appServerListenURL(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// One app-server serving every project: the thread, not the process, carries the
+// working directory and provider.
+func TestAppServerSession_ThreadRequestParamsCarryPerThreadTarget(t *testing.T) {
+	s := &appServerSession{
+		workDir:       "/root/.cc-connect/profiles/codex-test",
+		model:         "gpt-5.4",
+		modelProvider: "shengsuanyun",
+		mode:          "yolo",
+	}
+
+	params := s.threadRequestParams()
+
+	if got := params["cwd"]; got != s.workDir {
+		t.Fatalf("cwd = %v, want %q", got, s.workDir)
+	}
+	if got := params["model"]; got != "gpt-5.4" {
+		t.Fatalf("model = %v, want gpt-5.4", got)
+	}
+	if got := params["modelProvider"]; got != "shengsuanyun" {
+		t.Fatalf("modelProvider = %v, want shengsuanyun", got)
+	}
+	if got := params["approvalPolicy"]; got != "never" {
+		t.Fatalf("approvalPolicy = %v, want never", got)
+	}
+	if got := params["sandbox"]; got != "danger-full-access" {
+		t.Fatalf("sandbox = %v, want danger-full-access", got)
+	}
+}
+
+// app_server_scope mirrors hermes' multiplex_profiles: shared by default, one
+// private process per session on request.
+func TestNormalizeAppServerScope(t *testing.T) {
+	for in, want := range map[string]string{
+		"":            appServerScopeShared,
+		"shared":      appServerScopeShared,
+		"  SHARED  ":  appServerScopeShared,
+		"multiplex":   appServerScopeShared,
+		"one":         appServerScopeShared,
+		"nonsense":    appServerScopeShared,
+		"process":     appServerScopeProcess,
+		"private":     appServerScopeProcess,
+		"per-session": appServerScopeProcess,
+		"PER_SESSION": appServerScopeProcess,
+	} {
+		if got := normalizeAppServerScope(in); got != want {
+			t.Errorf("normalizeAppServerScope(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// A shared child must not inherit one project's provider credentials: those
+// travel per thread through the registry's CC_CODEX_KEY_* variables instead.
+func TestAppServerEnvForScope(t *testing.T) {
+	env := []string{
+		"HTTP_PROXY=http://proxy",
+		"OPENAI_API_KEY=sk-a",
+		"OPENAI_BASE_URL=https://a.example/v1",
+		"CODEX_HOME=/root/.codex",
+	}
+
+	shared := appServerEnvForScope(env, appServerScopeShared, "shengsuanyun")
+	if len(shared) != 1 || shared[0] != "HTTP_PROXY=http://proxy" {
+		t.Fatalf("shared env = %#v, want only the non-credential entry", shared)
+	}
+	// No provider means nothing is registered for this project, so its own
+	// credentials stay in the child's environment.
+	if got := appServerEnvForScope(env, appServerScopeShared, ""); len(got) != len(env) {
+		t.Fatalf("shared env without a provider = %#v, want the original env", got)
+	}
+	// scope=process keeps today's private-child behaviour untouched.
+	if got := appServerEnvForScope(env, appServerScopeProcess, "shengsuanyun"); len(got) != len(env) {
+		t.Fatalf("process env = %#v, want the original env", got)
+	}
+}
+
+func TestAppServerProviderDefsFromCore(t *testing.T) {
+	defs := appServerProviderDefsFromCore([]core.ProviderConfig{
+		{Name: "shengsuanyun", BaseURL: "https://api.example/v1", APIKey: "sk-1", CodexWireAPI: "responses"},
+		{Name: "no-base-url", APIKey: "sk-2"},
+		{Name: "", BaseURL: "https://ignored.example"},
+	})
+
+	if len(defs) != 1 {
+		t.Fatalf("defs = %#v, want only the provider with a base url", defs)
+	}
+	def := defs[0]
+	if def.Name != "shengsuanyun" || def.BaseURL != "https://api.example/v1" || def.APIKey != "sk-1" || def.WireAPI != "responses" {
+		t.Fatalf("def = %#v", def)
+	}
+	if def.EnvKey != "CC_CODEX_KEY_SHENGSUANYUN" {
+		t.Fatalf("EnvKey = %q, want CC_CODEX_KEY_SHENGSUANYUN", def.EnvKey)
+	}
+}
+
+func TestAppServerConn_RoutesNotificationsByThread(t *testing.T) {
+	conn := newTestConn(&lockedWriteCloser{})
+	t.Cleanup(func() { _ = conn.Close() })
+	first := newPinnedSession(t, conn, "thread-1", "turn-1")
+	second := newPinnedSession(t, conn, "thread-2", "turn-2")
+
+	params, err := json.Marshal(map[string]any{
+		"threadId": "thread-1",
+		"turn":     map[string]any{"id": "turn-1", "status": "completed"},
+	})
+	if err != nil {
+		t.Fatalf("marshal notification: %v", err)
+	}
+	conn.routeNotification("turn/completed", params)
+
+	if event := waitForEvent(t, first.events); event.Type != core.EventResult {
+		t.Fatalf("event = %#v, want the first session's turn result", event)
+	}
+	select {
+	case leaked := <-second.events:
+		t.Fatalf("second session received another thread's event %#v", leaked)
+	default:
+	}
+}
+
+// Closing one project's session must leave the shared child serving the others.
+func TestAppServerSession_CloseDetachesFromSharedProcess(t *testing.T) {
+	conn := newTestConn(&lockedWriteCloser{})
+	t.Cleanup(func() { _ = conn.Close() })
+	s := newPinnedSession(t, conn, "thread-1", "")
+
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if !conn.Alive() {
+		t.Fatal("shared app-server was torn down together with one session")
+	}
+	if conn.hasSessions() {
+		t.Fatal("session is still attached after Close")
+	}
+	if conn.sessionForThread("thread-1") != nil {
+		t.Fatal("thread route survived Close")
+	}
+	if _, ok := <-s.Events(); ok {
+		t.Fatal("events channel is still open after Close")
+	}
+}
+
+// scope=process keeps the pre-fork behaviour: the session owns its child.
+func TestAppServerSession_CloseOwnsPrivateProcessInProcessScope(t *testing.T) {
+	conn := newTestConn(&lockedWriteCloser{})
+	conn.pooled = false
+	s := newPinnedSession(t, conn, "thread-1", "")
+	s.connBase = appServerConnBase{scope: appServerScopeProcess}
+
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if conn.Alive() {
+		t.Fatal("process-scope session left its private app-server running")
+	}
+}
+
+// After the child dies, the next turn re-resumes the same thread on a fresh
+// process instead of losing the conversation.
+func TestAppServerSession_EnsureThreadAttachedResumesAfterProcessReplaced(t *testing.T) {
+	stdin := &lockedWriteCloser{}
+	conn := newTestConn(stdin)
+	t.Cleanup(func() { _ = conn.Close() })
+	s := newPinnedSession(t, conn, "thread-1", "")
+	s.workDir = "/root/.cc-connect/profiles/codex-rd"
+	s.attachedGen.Store(0) // the process that served this thread is gone
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.ensureThreadAttached()
+		done <- err
+	}()
+
+	request := waitForClientRequest(t, stdin)
+	if request.Method != "thread/resume" {
+		t.Fatalf("method = %q, want thread/resume", request.Method)
+	}
+	if got := request.Params["threadId"]; got != "thread-1" {
+		t.Fatalf("threadId = %v, want thread-1", got)
+	}
+	if got := request.Params["cwd"]; got != s.workDir {
+		t.Fatalf("cwd = %v, want %q", got, s.workDir)
+	}
+
+	result, err := json.Marshal(map[string]any{"thread": map[string]any{"id": "thread-1"}, "cwd": s.workDir})
+	if err != nil {
+		t.Fatalf("marshal response: %v", err)
+	}
+	conn.handleResponse(rpcResponseEnvelope{ID: request.ID, Result: result})
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("ensureThreadAttached() error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ensureThreadAttached did not finish")
+	}
+	if got := s.attachedGen.Load(); got != conn.Generation() {
+		t.Fatalf("attached generation = %d, want %d", got, conn.Generation())
+	}
+	if conn.sessionForThread("thread-1") != s {
+		t.Fatal("thread route was not re-bound to the session")
+	}
+}
+
+// A thread lock left over from the process we just replaced clears on its own;
+// a re-attach has to wait it out instead of failing the turn outright.
+func TestAppServerSession_EnsureThreadAttachedRetriesWhileWriterLockIsBusy(t *testing.T) {
+	restoreDelay := appServerAttachRetryDelay
+	appServerAttachRetryDelay = 5 * time.Millisecond
+	t.Cleanup(func() { appServerAttachRetryDelay = restoreDelay })
+
+	stdin := &lockedWriteCloser{}
+	conn := newTestConn(stdin)
+	t.Cleanup(func() { _ = conn.Close() })
+	s := newPinnedSession(t, conn, "thread-1", "")
+	s.attachedGen.Store(0)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.ensureThreadAttached()
+		done <- err
+	}()
+
+	first := waitForClientRequest(t, stdin)
+	if first.Method != "thread/resume" {
+		t.Fatalf("first method = %q, want thread/resume", first.Method)
+	}
+	conn.handleResponse(rpcResponseEnvelope{ID: first.ID, Error: &rpcError{
+		Message: "thread thread-1 already has an active writer",
+	}})
+
+	second := waitForClientRequestAt(t, stdin, 1)
+	if second.Method != "thread/resume" {
+		t.Fatalf("second method = %q, want a thread/resume retry", second.Method)
+	}
+	result, err := json.Marshal(map[string]any{"thread": map[string]any{"id": "thread-1"}})
+	if err != nil {
+		t.Fatalf("marshal response: %v", err)
+	}
+	conn.handleResponse(rpcResponseEnvelope{ID: second.ID, Result: result})
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("ensureThreadAttached() error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ensureThreadAttached did not finish after the lock cleared")
+	}
+	if got := s.attachedGen.Load(); got != conn.Generation() {
+		t.Fatalf("attached generation = %d, want %d", got, conn.Generation())
+	}
+}
+
+func TestAppServerSession_EnsureThreadAttachedStartsNewThreadWithoutRollout(t *testing.T) {
+	stdin := &lockedWriteCloser{}
+	conn := newTestConn(stdin)
+	t.Cleanup(func() { _ = conn.Close() })
+	s := newPinnedSession(t, conn, "thread-1", "")
+	s.preambleSent = true
+	s.attachedGen.Store(0)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.ensureThreadAttached()
+		done <- err
+	}()
+
+	resume := waitForClientRequest(t, stdin)
+	if resume.Method != "thread/resume" {
+		t.Fatalf("first method = %q, want thread/resume", resume.Method)
+	}
+	conn.handleResponse(rpcResponseEnvelope{ID: resume.ID, Error: &rpcError{
+		Message: "no rollout found for thread id thread-1",
+	}})
+
+	start := waitForClientRequestAt(t, stdin, 1)
+	if start.Method != "thread/start" {
+		t.Fatalf("second method = %q, want thread/start", start.Method)
+	}
+	result, err := json.Marshal(map[string]any{"thread": map[string]any{"id": "thread-2"}})
+	if err != nil {
+		t.Fatalf("marshal response: %v", err)
+	}
+	conn.handleResponse(rpcResponseEnvelope{ID: start.ID, Result: result})
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("ensureThreadAttached() error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ensureThreadAttached did not finish")
+	}
+	if got := s.CurrentSessionID(); got != "thread-2" {
+		t.Fatalf("session id = %q, want the replacement thread", got)
+	}
+	if conn.sessionForThread("thread-1") != nil {
+		t.Fatal("the dead thread id is still routed to the session")
+	}
+	s.stateMu.Lock()
+	preambleSent := s.preambleSent
+	s.stateMu.Unlock()
+	if preambleSent {
+		t.Fatal("a replacement thread has to receive the preamble again")
 	}
 }
