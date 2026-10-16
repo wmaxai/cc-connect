@@ -1292,11 +1292,26 @@ func (s *appServerSession) handleItemCompleted(item map[string]any) {
 
 	case "agentMessage":
 		text, _ := item["text"].(string)
-		if strings.TrimSpace(text) != "" {
-			s.stateMu.Lock()
-			s.pendingMsgs = append(s.pendingMsgs, text)
-			s.stateMu.Unlock()
+		if strings.TrimSpace(text) == "" {
+			break
 		}
+		// Codex tags mid-turn assistant text with a MessagePhase. Publish
+		// commentary as soon as the item completes: buffering it would demote it to
+		// EventThinking at the next tool call (handleItemStarted ->
+		// flushPendingAsThinking), and compact/quiet display modes drop thinking
+		// messages — so a long turn looks frozen until it ends and a mid-turn
+		// course correction gets no visible answer.
+		//
+		// Phaseless text and the turn's terminal answer keep the previous
+		// buffering: the protocol says an absent phase means "phase unknown", and
+		// completeTurn() still flushes the terminal answer as turn output.
+		if appServerIsInterimAgentText(appServerItemPhase(item)) {
+			s.emit(core.Event{Type: core.EventText, Content: text})
+			break
+		}
+		s.stateMu.Lock()
+		s.pendingMsgs = append(s.pendingMsgs, text)
+		s.stateMu.Unlock()
 
 	case "commandExecution":
 		command, _ := item["command"].(string)
@@ -1397,6 +1412,22 @@ func appServerDynamicToolText(raw any) string {
 		return appServerJSON(raw)
 	}
 	return strings.Join(parts, "\n")
+}
+
+// appServerItemPhase returns the MessagePhase Codex attached to an assistant
+// text item ("commentary", "partial_answer" or "final_answer"). Providers do not
+// emit it consistently, so an absent phase is reported as "" — phase unknown —
+// and callers keep their compatibility behavior for those items.
+func appServerItemPhase(item map[string]any) string {
+	phase, _ := item["phase"].(string)
+	return strings.ToLower(strings.TrimSpace(phase))
+}
+
+// appServerIsInterimAgentText reports whether an assistant text item is mid-turn
+// output the user should see as it arrives, as opposed to the turn's terminal
+// answer (or phaseless text, which stays on the buffered path).
+func appServerIsInterimAgentText(phase string) bool {
+	return phase == "commentary" || phase == "partial_answer"
 }
 
 func appServerToolSuccess(status string, exitCode *int) bool {
