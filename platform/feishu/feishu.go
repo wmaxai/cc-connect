@@ -346,17 +346,24 @@ func newPlatform(name, domain string, opts map[string]any) (core.Platform, error
 			domain = v
 		}
 	}
-	reactionEmoji, _ := opts["reaction_emoji"].(string)
-	if reactionEmoji == "" {
-		reactionEmoji = "OnIt"
-	}
-	if v, ok := opts["reaction_emoji"].(string); ok && v == "none" {
-		reactionEmoji = ""
-	}
 	ackEmoji, _ := opts["ack_emoji"].(string)
 	ackEmoji = strings.TrimSpace(ackEmoji)
 	if strings.EqualFold(ackEmoji, "none") {
 		ackEmoji = ""
+	}
+	// A persistent receipt already gives the user visible feedback while the
+	// turn is running, so do not stack the default temporary "OnIt" reaction on
+	// top of an explicitly configured ack emoji. Users who want both can still
+	// opt in by setting reaction_emoji explicitly.
+	reactionEmoji := "OnIt"
+	if ackEmoji != "" {
+		reactionEmoji = ""
+	}
+	if v, ok := opts["reaction_emoji"].(string); ok && v != "" {
+		reactionEmoji = v
+		if v == "none" {
+			reactionEmoji = ""
+		}
 	}
 	doneEmoji, _ := opts["done_emoji"].(string)
 	if doneEmoji == "none" {

@@ -61,6 +61,29 @@ func awaitReceiptRequest(t *testing.T, requests <-chan receiptRequest) receiptRe
 	}
 }
 
+func TestReactionEmoji_AckSuppressesDefaultProcessingEmoji(t *testing.T) {
+	tests := []struct {
+		name     string
+		opts     map[string]any
+		wantAck  string
+		wantType string
+	}{
+		{"no ack keeps default processing", map[string]any{}, "", "OnIt"},
+		{"ack replaces default processing", map[string]any{"ack_emoji": "Get"}, "Get", ""},
+		{"explicit processing can stack with ack", map[string]any{"ack_emoji": "Get", "reaction_emoji": "OnIt"}, "Get", "OnIt"},
+		{"explicit none disables processing", map[string]any{"ack_emoji": "Get", "reaction_emoji": "none"}, "Get", ""},
+		{"ack none keeps default processing", map[string]any{"ack_emoji": "none"}, "", "OnIt"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			p := receiptTestPlatform(t, tc.opts, func(http.ResponseWriter, *http.Request) {})
+			if p.ackEmoji != tc.wantAck || p.reactionEmoji != tc.wantType {
+				t.Fatalf("ack/reaction = %q/%q, want %q/%q", p.ackEmoji, p.reactionEmoji, tc.wantAck, tc.wantType)
+			}
+		})
+	}
+}
+
 // This test also runs unchanged against pre-feature main: the prior history
 // callback runs, but no receipt request is sent, so the test fails.
 func TestReceiptAcknowledgement_AcceptedMessagePersistsThroughTypingCleanup(t *testing.T) {
